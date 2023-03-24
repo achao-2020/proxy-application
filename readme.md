@@ -42,15 +42,11 @@ public static void main(String[] args) {
 
 <img src="./png/img.png" title="" alt="" data-align="center">
 
-
-
 ## 2. 动态代理应用
 
     在mybatis中，使用到了很多的动态代理，用来获取maper，完成拦截器的功能。
 
-
-
-### 2.1 mapper代理
+### 2.1 mybatis中mapper代理分析
 
     mybatis中获取到了sqlSession对象后，便使用`sqlSession.getMapper`获取mapper，这里便使用到了动态代理。
 
@@ -71,8 +67,6 @@ public static void main(String[] args) {
     return mapperMethod.execute(sqlSession, args);
   }
 ```
-
-
 
 **MapperMethod**
 
@@ -116,8 +110,6 @@ public interface DemoMapper {
 }
 ```
 
-
-
 - 自定义invocation
 
 ```java
@@ -134,8 +126,6 @@ public class MapperInvocation implements InvocationHandler {
     }
 }
 ```
-
-
 
 - 定义mapperMethod用来解析
 
@@ -201,8 +191,6 @@ public class MapperMethod {
 }
 ```
 
-
-
 - 定义factory统一入口
 
 ```java
@@ -223,8 +211,6 @@ public class MapperProxyFactory {
 }
 ```
 
-
-
 - 实现效果
 
 ```java
@@ -238,8 +224,161 @@ public class MapperProxyFactory {
 
 
 
-### 2.3 拦截器代理
+### 2.3 拦截器代理分析
 
     这部分内容我是比较好奇的，再看了相关的文章，说mybatis的拦截器，是在executor，ResultSetHandler的动态代理中进行拦截的。疑问点在于，动态代理的对象是接口，并不是定义的实体类，也不是抽象类，怎么能在executor真实方法调用接口进行拦截呢。
 
     带着上述疑问，打开mybatis源码进行研究。
+
+**InterceptorChain**
+
+![](./png/img_2.png)
+
+mybatis在创建执行器的时候，使用InterceptorChain对executor**子类对象**进行处理后返回。这里面便使用了代理。
+
+![](./png/img_3.png)
+
+这个类里面，注入了所有定义的拦截器，并循环对executor进行了代理。具体看下面的这个示例插件。
+
+
+
+**ExamplePlugin**
+
+![](./png/img_4.png)
+
+**Plugin**
+
+![](./png/img_5.png)
+
+这个类实现了`InvocationHandler`，并对代理对象的注解进行了解析(拦截哪些类，拦截哪些方法)，最后将支持拦截的接口（interfaces）进行动态代理返回。
+
+![](./png/img_6.png)
+
+这里关键的两段逻辑是，对进来的方法判断需不需要拦击器处理。然后再调用真实对象(target)的方法。
+
+
+
+**看到这里就明白了，实际上mybatis执行的executor是一个动态代理的对象，并且，这是根据拦截器数量，返回的多层动态代理。**
+
+
+
+### 2.4 模仿拦截器代理
+
+先画一个UML图吧
+
+![](./png/img_7.png)
+
+核心的类图是这样的，当然还需要注解，和创建Executor工厂类。
+
+
+
+**ExecutorFactory**
+
+```java
+public class ExecutorFactory {
+
+    public static Executor newExecutor() {
+        // 代理目标执行器实例
+        SimpleExecutor executor = new SimpleExecutor();
+        // 两个拦截器
+        QueryInterceptor queryInterceptor = new QueryInterceptor();
+        InsertInterceptor insertInterceptor = new InsertInterceptor();
+        List<Interceptor> interceptors = new ArrayList<>(2);
+        interceptors.add(queryInterceptor);
+        interceptors.add(insertInterceptor);
+        InterceptorChain interceptorChain = new InterceptorChain(interceptors);
+        // 生成代理执行器
+        return interceptorChain.plugin(executor);
+    }
+}
+```
+
+
+
+**InterceptorChain**
+
+```java
+public class InterceptorChain {
+    private List<Interceptor> interceptors;
+
+    public InterceptorChain(List<Interceptor> interceptors) {
+        this.interceptors = interceptors;
+    }
+
+
+    public Executor plugin(Executor executor) {
+        for (Interceptor interceptor : interceptors) {
+            // 循环返回代理对象，套娃
+            executor = interceptor.wrap(executor);
+        }
+        return executor;
+    }
+}
+```
+
+
+
+
+
+**AbstractInterceptor**
+
+```java
+public abstract class AbstractInterceptor implements Interceptor{
+    /**
+     * 生成代理对象
+     * @param executor
+     * @return
+     */
+    @Override
+    public Executor wrap(Executor executor) {
+        InterceptorClass annotation = this.getClass().getAnnotation(InterceptorClass.class);
+        if (annotation == null || annotation.methods().length == 0) {
+            // 不进行代理
+            return executor;
+        }
+
+        // 能够代理的类
+        Class[] interfaces = annotation.targets();
+        return (Executor) Proxy.newProxyInstance(
+                Executor.class.getClassLoader(),
+                interfaces,
+                new ExecutorProxy(executor, this, Arrays.stream(annotation.methods()).collect(Collectors.toSet())));
+    }
+}
+```
+
+
+
+**ExecutorProxy**
+
+```java
+public class ExecutorProxy implements InvocationHandler {
+
+    private Object target;
+
+    private Interceptor interceptor;
+
+    private Set<String> supportMethods;
+
+    public ExecutorProxy(Object target, Interceptor interceptor, Set<String> supportMethods) {
+        this.target = target;
+        this.interceptor = interceptor;
+        this.supportMethods = supportMethods;
+    }
+
+    @Override
+    public Object invoke(Object o, Method method, Object[] objects) throws Throwable {
+        // 执行拦截器方法
+        if (supportMethods.contains(method.getName())) {
+            return interceptor.intercept(new Invocation(target, method, objects));
+        }
+        return method.invoke(target, objects);
+    }
+}
+```
+
+
+
+## 3. 总结
+
+    实际上，java代理可以实现对接口和普通类的代理，虽然官方方法`Proxy.newInstance`只支持传入接口类型类，但是同样可以对实例对象传递，在invoke执行时，调用真实对象的方法。
